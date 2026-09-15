@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"google.golang.org/genai"
@@ -28,6 +29,19 @@ type ChatResponse struct {
 // Global thread-safe bare-metal Gemini Client instance
 var geminiClient *genai.Client
 
+// httpConnPool is the shared, tuned outbound transport used for every real
+// network call the gateway makes — both to Gemini and (in MOCK_LLM mode) to
+// the local mock LLM server, so a stress test actually exercises the same
+// connection-pooling path production traffic would.
+var httpConnPool = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        500,
+		MaxIdleConnsPerHost: 200,
+		IdleConnTimeout:     90 * time.Second,
+	},
+	Timeout: 10 * time.Second, // Maximum duration constraint to protect the gateway
+}
+
 func init() {
     var err error
 	// Automatically scans your current root folder for a file named '.env'
@@ -38,22 +52,27 @@ func init() {
 		log.Println("✅ Environment configuration values loaded from local .env cleanly.")
 	}
 
-	// Initialize the Google GenAI SDK client context
-	// It automatically hooks into os.Getenv("GOOGLE_API_KEY")
 	ctx := context.Background()
-	
-	geminiClient, err = genai.NewClient(ctx, nil)
+
+	// We pass our optimized pool directly into the Client configuration block
+	config := &genai.ClientConfig{
+		HTTPClient: httpConnPool, // Forces Gemini to use our socket transport pool
+	}
+
+	geminiClient, err = genai.NewClient(ctx, config)
 	if err != nil {
 		log.Fatalf("❌ Failed to instantiate native Google GenAI Go Client: %v", err)
 	}
-	log.Println("✅ Native Google GenAI Client pool compiled and ready.")
+	log.Println("✅ Gemini Client successfully bound to customized HTTP Connection Pool.")
 
-	// Set MOCK_LLM=true to bypass the live Gemini call with a canned response.
-	// Use this during vegeta/load testing so results reflect gateway throughput
-	// rather than upstream model latency, rate limits, or cost.
+
+	// Set MOCK_LLM=true to bypass the live Gemini call with a call to a local
+	// mock LLM server instead. This keeps stress tests on a real network/socket
+	// path (exercising httpConnPool) without depending on the live model endpoint.
 	if strings.EqualFold(os.Getenv("MOCK_LLM"), "true") {
+		startMockLLMServer(mockLLMAddr)
 		resolutionGenerator = mockResolutionText
-		log.Println("🧪 MOCK_LLM=true — resolutionGenerator swapped to mockResolutionText for stress testing.")
+		log.Println("🧪 MOCK_LLM=true — resolutionGenerator swapped to mockResolutionText (local HTTP mock) for stress testing.")
 	}
 }
 

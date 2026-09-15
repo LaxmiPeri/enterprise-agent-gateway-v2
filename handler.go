@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -135,19 +136,35 @@ func generateResolutionText(ctx context.Context, prompt, dbContext string) (stri
 	return "I have successfully verified your tracking coordinates. Your delivery status is officially marked as confirmed.", nil
 }
 
-// mockLLMLatency approximates typical Gemini response time so load tests
-// exercise realistic connection/goroutine-under-load behavior instead of
-// returning instantly.
-const mockLLMLatency = 800 * time.Millisecond
-
-// mockResolutionText simulates a Gemini call's latency without making an
-// outbound request, so vegeta-style stress tests can measure gateway
-// behavior under realistic response times without burning Gemini quota.
+// mockResolutionText calls the local mock LLM server (see mock_llm_server.go)
+// over a real HTTP connection through httpConnPool, so vegeta-style stress
+// tests exercise actual socket/connection-pool behavior instead of just
+// sleeping in-process, without burning Gemini quota.
 func mockResolutionText(ctx context.Context, prompt, dbContext string) (string, error) {
-	select {
-	case <-time.After(mockLLMLatency):
-		return "MOCK RESOLUTION: Request reviewed against verified order telemetry and resolved.", nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	reqBody, err := json.Marshal(mockLLMRequest{Prompt: prompt, DBContext: dbContext})
+	if err != nil {
+		return "", err
 	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+mockLLMAddr+"/generate", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpConnPool.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("mock LLM server returned status %d", resp.StatusCode)
+	}
+
+	var out mockLLMResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Text, nil
 }
